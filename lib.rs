@@ -1,9 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-
 #[ink::contract]
 mod nostr_contract {
-    use ink::storage::Lazy;
 
     #[ink(storage)]
     pub struct NostrContract {
