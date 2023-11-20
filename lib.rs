@@ -24,6 +24,8 @@ mod nostr_ink {
         subscriber: AccountId,
         relayer_id: AccountId,
         duration: SubscriptionDuration,
+        start_date: u64,
+        expiry_date: u64,
     }
 
     #[derive(Debug, Clone)]
@@ -33,8 +35,6 @@ mod nostr_ink {
         price_per_month: Balance,
         price_per_week: Balance,
         price_per_year: Balance,
-        start_date: u64,
-        expiry_date: u64,
         subscribers: Vec<AccountId>,
     }
 
@@ -61,14 +61,6 @@ mod nostr_ink {
     #[ink(event)]
     pub struct Subscribed {
         pub subscriber: AccountId,
-        pub relayer: AccountId,
-        pub amount: Balance,
-    }
-
-    #[derive(PartialEq)]
-    #[ink(event)]
-    pub struct Staked {
-        pub staker: AccountId,
         pub relayer: AccountId,
         pub amount: Balance,
     }
@@ -129,117 +121,55 @@ mod nostr_ink {
             price_per_month: Balance,
             price_per_year: Balance,
         ) {
-            let start_date = self.env().block_timestamp();
-
-            let expiry_date_monthly = start_date + 30 * 24 * 60 * 60;
-            let expiry_date_weekly = start_date + 7 * 24 * 60 * 60;
-            let expiry_date_yearly = start_date + 365 * 24 * 60 * 60;
-
             self.subscription_plans.push(SubscriptionPlan {
                 relayer_id,
                 price_per_week,
                 price_per_month,
                 price_per_year,
-                start_date,
-                expiry_date: expiry_date_monthly,
                 subscribers: Vec::new(),
             });
-
-            self.subscription_plans.push(SubscriptionPlan {
-                relayer_id,
-                price_per_week,
-                price_per_month,
-                price_per_year,
-                start_date,
-                expiry_date: expiry_date_weekly,
-                subscribers: Vec::new(),
-            });
-
-            self.subscription_plans.push(SubscriptionPlan {
-                relayer_id,
-                price_per_week,
-                price_per_month,
-                price_per_year,
-                start_date,
-                expiry_date: expiry_date_yearly,
-                subscribers: Vec::new(),
-            });
-        }
-
-        #[ink(message)]
-        pub fn set_start_date(&mut self, plan_index: u32) {
-            let current_time = self.env().block_timestamp();
-            if let Some(plan) = self.subscription_plans.get_mut(plan_index as usize) {
-                plan.start_date = current_time;
-                self.env().emit_event(StartDateTimeSet {
-                    start_date: current_time,
-                });
-            }
-        }
-
-        #[ink(message)]
-        pub fn set_expiry_date(&mut self, plan_index: u32, duration: u64) {
-            let expiry_date;
-
-            {
-                let plan = self
-                    .subscription_plans
-                    .get_mut(plan_index as usize)
-                    .expect("Invalid plan index");
-
-                expiry_date = plan.start_date + duration;
-            }
-
-            if let Some(plan) = self.subscription_plans.get_mut(plan_index as usize) {
-                plan.expiry_date = expiry_date;
-                ink::env::debug_println!(
-                    "{}",
-                    ink::prelude::format!("Expiry date updated to: {:?}", expiry_date)
-                );
-                self.env().emit_event(ExpiryDateTimeSet { expiry_date });
-            }
         }
 
         #[ink(message)]
         pub fn subscribe_to_plan(&mut self, relayer_id: AccountId, duration: SubscriptionDuration) {
             let caller = self.env().caller();
+            let current_time = self.env().block_timestamp();
+
             if let Some(plan) = self
                 .subscription_plans
                 .iter_mut()
                 .find(|p| p.relayer_id == relayer_id)
             {
-                match duration {
-                    SubscriptionDuration::Month => {
-                        plan.subscribers.push(caller);
-                        self.subscriptions.push(Subscription {
-                            subscriber: caller,
-                            relayer_id,
-                            duration: SubscriptionDuration::Month,
-                        });
-                    }
-                    SubscriptionDuration::Week => {
-                        plan.subscribers.push(caller);
-                        self.subscriptions.push(Subscription {
-                            subscriber: caller,
-                            relayer_id,
-                            duration: SubscriptionDuration::Week,
-                        });
-                    }
-                    SubscriptionDuration::Year => {
-                        plan.subscribers.push(caller);
-                        self.subscriptions.push(Subscription {
-                            subscriber: caller,
-                            relayer_id,
-                            duration: SubscriptionDuration::Year,
-                        });
-                    }
+                let (start_date, expiry_date) = match duration {
+                    SubscriptionDuration::Month => (
+                        current_time,
+                        current_time + 30 * 24 * 60 * 60,
+                    ),
+                    SubscriptionDuration::Week => (
+                        current_time,
+                        current_time + 7 * 24 * 60 * 60,
+                    ),
+                    SubscriptionDuration::Year => (
+                        current_time,
+                        current_time + 365 * 24 * 60 * 60,
+                    ),
                     SubscriptionDuration::Unknown => {
                         self.env().emit_event(SubscriptionPlanNotFound {
                             relayer_id,
                             subscriber: caller,
                         });
+                        return;
                     }
-                }
+                };
+
+                plan.subscribers.push(caller);
+                self.subscriptions.push(Subscription {
+                    subscriber: caller,
+                    relayer_id,
+                    duration,
+                    start_date,
+                    expiry_date,
+                });
             } else {
                 self.env().emit_event(SubscriptionPlanNotFound {
                     relayer_id,
@@ -320,52 +250,40 @@ mod nostr_ink {
             relayer_id: AccountId,
             subscriber: AccountId,
         ) -> Option<Subscription> {
-            self.subscription_plans
+            self.subscriptions
                 .iter()
-                .flat_map(|plan| plan.subscribers.iter().map(move |sub| (plan, *sub)))
-                .find(|(plan, sub)| plan.relayer_id == relayer_id && *sub == subscriber)
-                .map(|(plan, expiry_date)| {
-                    let duration = match plan.price_per_month {
-                        0 => SubscriptionDuration::Unknown,
-                        price => {
-                            let now = self.env().block_timestamp();
-                            if plan.expiry_date >= now {
-                                if plan.price_per_week > 0 {
-                                    SubscriptionDuration::Week
-                                } else if plan.price_per_year > 0 {
-                                    SubscriptionDuration::Year
-                                } else {
-                                    SubscriptionDuration::Month
-                                }
-                            } else {
-                                SubscriptionDuration::Unknown
-                            }
-                        }
-                    };
-
-                    Subscription {
-                        relayer_id: plan.relayer_id,
-                        duration,
-                        subscriber,
-                    }
-                })
+                .find(|s| s.relayer_id == relayer_id && s.subscriber == subscriber)
+                .cloned()
         }
 
         #[ink(message)]
-        pub fn get_subscribers(&self, relayer_id: AccountId) -> Vec<AccountId> {
+        pub fn get_subscribers(&self, relayer_id: AccountId) -> Vec<(AccountId, u64, u64)> {
             // Find the subscription plan for the given relayer
             if let Some(plan) = self
                 .subscription_plans
                 .iter()
                 .find(|p| p.relayer_id == relayer_id)
             {
-                // Return the list of subscribers for the found subscription plan
-                plan.subscribers.clone()
+                // Return a vector of tuples containing subscribers, start_date, and expiry_date
+                plan.subscribers
+                    .iter()
+                    .map(|&subscriber| {
+                        let subscription = self
+                            .subscriptions
+                            .iter()
+                            .find(|s| s.relayer_id == relayer_id && s.subscriber == subscriber)
+                            .unwrap_or_else(|| panic!("Subscription not found for subscriber: {:?}", subscriber));
+        
+                        (subscriber, subscription.start_date, subscription.expiry_date)
+                    })
+                    .collect()
             } else {
                 // If the subscription plan for the relayer is not found, return an empty vector
                 Vec::new()
             }
         }
+        
+        
 
         #[ink(message)]
         pub fn get_report(&self, report_id: u64) -> Option<Report> {
