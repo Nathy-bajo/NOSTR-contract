@@ -1,44 +1,76 @@
 #![cfg_attr(not(feature = "std"), no_std, no_main)]
 
 #[ink::contract]
-mod nostr_contract {
+mod nostr_ink {
+
+    use ink::prelude::vec::Vec;
+
+    const REWARD_AMOUNT: Balance = 100;
+    const PENALTY_AMOUNT: Balance = 50;
 
     #[ink(storage)]
     pub struct NostrContract {
         owner: AccountId,
+        subscription_plans: Vec<SubscriptionPlan>,
         subscriptions: Vec<Subscription>,
-        pub relayer_stakes: Vec<(AccountId, Balance)>,
         pub reports: Vec<Report>,
         next_report_id: u64,
         challenger: Option<AccountId>,
     }
 
-    #[derive(Debug, Clone, scale::Encode, scale::Decode, scale_info::TypeInfo)]
+    #[derive(Debug, Clone)]
+    #[ink::scale_derive(Encode, Decode, TypeInfo)]
     pub struct Subscription {
-        relayer: AccountId,
-        amount: Balance,
+        subscriber: AccountId,
+        relayer_id: AccountId,
+        duration: SubscriptionDuration,
     }
 
-    #[derive(Debug, Clone, scale::Encode, scale::Decode, scale_info::TypeInfo)]
+    #[derive(Debug, Clone)]
+    #[ink::scale_derive(Encode, Decode, TypeInfo)]
+    pub struct SubscriptionPlan {
+        relayer_id: AccountId,
+        price_per_month: Balance,
+        price_per_week: Balance,
+        price_per_year: Balance,
+        start_date: u64,
+        expiry_date: u64,
+        subscribers: Vec<AccountId>,
+    }
+
+    #[derive(Debug, Clone)]
+    #[ink::scale_derive(Encode, Decode, TypeInfo)]
+    pub enum SubscriptionDuration {
+        Month,
+        Week,
+        Year,
+        Unknown,
+    }
+
+    #[derive(Debug, Clone)]
+    #[ink::scale_derive(Encode, Decode, TypeInfo)]
     pub struct Report {
         pub reporter: AccountId,
         relayer: AccountId,
         pub description: Vec<u8>,
         pub challenged: bool,
+        report_id: u64,
     }
 
+    #[derive(PartialEq)]
     #[ink(event)]
     pub struct Subscribed {
-        subscriber: AccountId,
-        relayer: AccountId,
-        amount: Balance,
+        pub subscriber: AccountId,
+        pub relayer: AccountId,
+        pub amount: Balance,
     }
 
+    #[derive(PartialEq)]
     #[ink(event)]
     pub struct Staked {
-        staker: AccountId,
-        relayer: AccountId,
-        amount: Balance,
+        pub staker: AccountId,
+        pub relayer: AccountId,
+        pub amount: Balance,
     }
 
     #[ink(event)]
@@ -55,6 +87,26 @@ mod nostr_contract {
         report_id: u64,
     }
 
+    #[ink(event)]
+    pub struct SubscriptionPlanNotFound {
+        #[ink(topic)]
+        relayer_id: AccountId,
+        #[ink(topic)]
+        subscriber: AccountId,
+    }
+
+    #[ink(event)]
+    pub struct StartDateTimeSet {
+        #[ink(topic)]
+        start_date: u64,
+    }
+
+    #[ink(event)]
+    pub struct ExpiryDateTimeSet {
+        #[ink(topic)]
+        expiry_date: u64,
+    }
+
     impl NostrContract {
         #[ink(constructor)]
         pub fn new() -> Self {
@@ -62,7 +114,7 @@ mod nostr_contract {
             Self {
                 owner: caller,
                 subscriptions: Vec::new(),
-                relayer_stakes: Vec::new(),
+                subscription_plans: Vec::new(),
                 reports: Vec::new(),
                 next_report_id: 1,
                 challenger: None,
@@ -70,45 +122,139 @@ mod nostr_contract {
         }
 
         #[ink(message)]
-        pub fn subscribe(&mut self, relayer: AccountId, amount: Balance) {
-            let caller = self.env().caller();
-            assert_ne!(caller, relayer, "You cannot subscribe to yourself");
+        pub fn create_subscription_plan(
+            &mut self,
+            relayer_id: AccountId,
+            price_per_week: Balance,
+            price_per_month: Balance,
+            price_per_year: Balance,
+        ) {
+            let start_date = self.env().block_timestamp();
 
-            self.subscriptions.push(Subscription { relayer, amount });
+            let expiry_date_monthly = start_date + 30 * 24 * 60 * 60;
+            let expiry_date_weekly = start_date + 7 * 24 * 60 * 60;
+            let expiry_date_yearly = start_date + 365 * 24 * 60 * 60;
 
-            self.env().emit_event(Subscribed {
-                subscriber: caller,
-                relayer,
-                amount,
+            self.subscription_plans.push(SubscriptionPlan {
+                relayer_id,
+                price_per_week,
+                price_per_month,
+                price_per_year,
+                start_date,
+                expiry_date: expiry_date_monthly,
+                subscribers: Vec::new(),
+            });
+
+            self.subscription_plans.push(SubscriptionPlan {
+                relayer_id,
+                price_per_week,
+                price_per_month,
+                price_per_year,
+                start_date,
+                expiry_date: expiry_date_weekly,
+                subscribers: Vec::new(),
+            });
+
+            self.subscription_plans.push(SubscriptionPlan {
+                relayer_id,
+                price_per_week,
+                price_per_month,
+                price_per_year,
+                start_date,
+                expiry_date: expiry_date_yearly,
+                subscribers: Vec::new(),
             });
         }
 
         #[ink(message)]
-        pub fn stake(&mut self) {
-            let caller = self.env().caller();
-            if let Some(subscription) = self.subscriptions.last() {
-                let (relayer, amount) = (subscription.relayer, subscription.amount);
-
-                let existing_stake =
-                    match self.relayer_stakes.iter_mut().find(|(r, _)| *r == relayer) {
-                        Some((_, s)) => s,
-                        None => {
-                            self.relayer_stakes.push((relayer, 0)); // Add a new stake entry
-                            &mut self.relayer_stakes.last_mut().unwrap().1 // Borrow the mutable reference
-                        }
-                    };
-
-                *existing_stake += amount;
-
-                self.env().emit_event(Staked {
-                    staker: caller,
-                    relayer,
-                    amount,
+        pub fn set_start_date(&mut self, plan_index: u32) {
+            let current_time = self.env().block_timestamp();
+            if let Some(plan) = self.subscription_plans.get_mut(plan_index as usize) {
+                plan.start_date = current_time;
+                self.env().emit_event(StartDateTimeSet {
+                    start_date: current_time,
                 });
             }
         }
+
         #[ink(message)]
-        pub fn report(&mut self, relayer: AccountId, report_id: u64, reporter: AccountId, description: Vec<u8>) {
+        pub fn set_expiry_date(&mut self, plan_index: u32, duration: u64) {
+            let expiry_date;
+
+            {
+                let plan = self
+                    .subscription_plans
+                    .get_mut(plan_index as usize)
+                    .expect("Invalid plan index");
+
+                expiry_date = plan.start_date + duration;
+            }
+
+            if let Some(plan) = self.subscription_plans.get_mut(plan_index as usize) {
+                plan.expiry_date = expiry_date;
+                ink::env::debug_println!(
+                    "{}",
+                    ink::prelude::format!("Expiry date updated to: {:?}", expiry_date)
+                );
+                self.env().emit_event(ExpiryDateTimeSet { expiry_date });
+            }
+        }
+
+        #[ink(message)]
+        pub fn subscribe_to_plan(&mut self, relayer_id: AccountId, duration: SubscriptionDuration) {
+            let caller = self.env().caller();
+            if let Some(plan) = self
+                .subscription_plans
+                .iter_mut()
+                .find(|p| p.relayer_id == relayer_id)
+            {
+                match duration {
+                    SubscriptionDuration::Month => {
+                        plan.subscribers.push(caller);
+                        self.subscriptions.push(Subscription {
+                            subscriber: caller,
+                            relayer_id,
+                            duration: SubscriptionDuration::Month,
+                        });
+                    }
+                    SubscriptionDuration::Week => {
+                        plan.subscribers.push(caller);
+                        self.subscriptions.push(Subscription {
+                            subscriber: caller,
+                            relayer_id,
+                            duration: SubscriptionDuration::Week,
+                        });
+                    }
+                    SubscriptionDuration::Year => {
+                        plan.subscribers.push(caller);
+                        self.subscriptions.push(Subscription {
+                            subscriber: caller,
+                            relayer_id,
+                            duration: SubscriptionDuration::Year,
+                        });
+                    }
+                    SubscriptionDuration::Unknown => {
+                        self.env().emit_event(SubscriptionPlanNotFound {
+                            relayer_id,
+                            subscriber: caller,
+                        });
+                    }
+                }
+            } else {
+                self.env().emit_event(SubscriptionPlanNotFound {
+                    relayer_id,
+                    subscriber: caller,
+                });
+            }
+        }
+
+        #[ink(message)]
+        pub fn get_subscription_plans(&self) -> Vec<SubscriptionPlan> {
+            self.subscription_plans.clone()
+        }
+
+        #[ink(message)]
+        pub fn report(&mut self, relayer: AccountId, description: Vec<u8>) {
             let caller = self.env().caller();
 
             let next_report_id = self.next_report_id;
@@ -119,6 +265,7 @@ mod nostr_contract {
                 relayer,
                 description: description.clone(),
                 challenged: false,
+                report_id: next_report_id,
             });
 
             self.env().emit_event(Reported {
@@ -130,94 +277,105 @@ mod nostr_contract {
         }
 
         #[ink(message)]
-        pub fn set_challenger(&mut self, challenger: AccountId) {
-            // Implement a setter function to set the challenger account
-            self.challenger = Some(challenger);
+        pub fn challenge(&mut self, report_id: u64) {
+            let caller = self.env().caller();
+
+            if Some(caller) == self.challenger {
+                if let Some(report) = self
+                    .reports
+                    .iter_mut()
+                    .find(|r| r.reporter == caller && r.report_id == report_id && !r.challenged)
+                {
+                    report.challenged = true;
+
+                    if Self::report_is_valid(&report) {
+                        // Reward relayer for providing valid data.
+                    } else {
+                        // Penalize relayer for providing invalid data.
+                    }
+
+                    self.env().emit_event(Challenged {
+                        reporter: caller,
+                        report_id,
+                    });
+                } else {
+                    panic!("Invalid report or challenge request");
+                }
+            } else {
+                panic!("Only the assigned challenger can challenge reports");
+            }
+        }
+
+        fn report_is_valid(report: &Report) -> bool {
+            if !report.description.is_empty() && !report.challenged {
+                true
+            } else {
+                false
+            }
         }
 
         #[ink(message)]
-        pub fn challenge(&mut self, report_id: u64, challenger: AccountId) {
-            let caller = self.env().caller();
-    
-            // Check if the caller is the stored challenger account
-            if Some(caller) == self.challenger {
-                let report = self
-                    .reports
-                    .iter_mut()
-                    .find(|r| r.reporter == caller && r.challenged == false)
-                    .unwrap();
-    
-                report.challenged = true;
-    
-                self.env().emit_event(Challenged {
-                    reporter: caller,
-                    report_id,
-                });
+        pub fn get_subscription(
+            &self,
+            relayer_id: AccountId,
+            subscriber: AccountId,
+        ) -> Option<Subscription> {
+            self.subscription_plans
+                .iter()
+                .flat_map(|plan| plan.subscribers.iter().map(move |sub| (plan, *sub)))
+                .find(|(plan, sub)| plan.relayer_id == relayer_id && *sub == subscriber)
+                .map(|(plan, expiry_date)| {
+                    let duration = match plan.price_per_month {
+                        0 => SubscriptionDuration::Unknown,
+                        price => {
+                            let now = self.env().block_timestamp();
+                            if plan.expiry_date >= now {
+                                if plan.price_per_week > 0 {
+                                    SubscriptionDuration::Week
+                                } else if plan.price_per_year > 0 {
+                                    SubscriptionDuration::Year
+                                } else {
+                                    SubscriptionDuration::Month
+                                }
+                            } else {
+                                SubscriptionDuration::Unknown
+                            }
+                        }
+                    };
+
+                    Subscription {
+                        relayer_id: plan.relayer_id,
+                        duration,
+                        subscriber,
+                    }
+                })
+        }
+
+        #[ink(message)]
+        pub fn get_subscribers(&self, relayer_id: AccountId) -> Vec<AccountId> {
+            // Find the subscription plan for the given relayer
+            if let Some(plan) = self
+                .subscription_plans
+                .iter()
+                .find(|p| p.relayer_id == relayer_id)
+            {
+                // Return the list of subscribers for the found subscription plan
+                plan.subscribers.clone()
             } else {
-                // Handle unauthorized challenges
-                // For example: Emit an event or revert the transaction
-                // You can implement your specific logic here
+                // If the subscription plan for the relayer is not found, return an empty vector
+                Vec::new()
             }
         }
-    
-    }
-}
 
-#[cfg(test)]
-mod tests {
-    use crate::nostr_contract::NostrContract;
-
-    use ink::env::{test, DefaultEnvironment};
-
-    use super::*;
-
-    #[ink::test]
-    fn test_subscribe_and_stake() {
-        // Deploy the contract
-        let mut contract = NostrContract::new();
-
-        // Get accounts
-        let accounts = test::default_accounts::<DefaultEnvironment>();
-
-        // Subscribe and stake
-        contract.subscribe(accounts.bob, 100);
-        contract.stake();
-
-        // Get the relayer stakes
-        let relayer_stakes = contract.relayer_stakes;
-        assert_eq!(relayer_stakes.len(), 1);
-        assert_eq!(relayer_stakes[0].0, accounts.bob);
-        assert_eq!(relayer_stakes[0].1, 100);
+        #[ink(message)]
+        pub fn get_report(&self, report_id: u64) -> Option<Report> {
+            self.reports
+                .iter()
+                .find(|r| r.report_id == report_id)
+                .cloned()
+        }
     }
 
-    #[ink::test]
-    fn test_report_and_challenge() {
-        // Use the test environment to set up test accounts.
-        let accounts = test::default_accounts::<DefaultEnvironment>();
-    
-        // Deploy the contract
-        let mut contract = NostrContract::new();
-
-
-        // Subscribe and stake
-        contract.subscribe(accounts.alice, 100);
-        contract.stake();
-    
-        // Report an issue with one account (e.g., accounts.bob)
-        // contract.report(accounts.bob, vec![1, 2, 3]);
-    
-        // Set the challenger account within the contract
-        contract.set_challenger(accounts.bob);
-    
-        // Challenge the report
-        contract.challenge(1, accounts.bob);
-    
-        // Get the challenged report
-        let reports = &contract.reports;
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].reporter, accounts.bob); // Ensure the reporter matches the account used for reporting
-        assert_eq!(reports[0].challenged, true);
-    
-    }
-    
+    #[cfg(test)]
+    mod tests {}
 }
